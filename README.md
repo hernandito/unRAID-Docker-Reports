@@ -14,7 +14,7 @@ This project starts as a UserScript, As a second part of this project, you can i
 ## Overview
 Docker Reports is a high-fidelity "Time Machine" for your Unraid Docker templates. It audits your configurations every time it runs, tracking changes to Ports, Paths, and Variables, and even allows you to recover configurations from deleted containers.
 
-📦 **Asset Download:** `unRAID_Docker_Reports.zip` *(See releases/files to download)*
+📦 **Asset Download:** `unRAID_docker_reports.zip` *(See releases/files to download)*
 
 ---
 
