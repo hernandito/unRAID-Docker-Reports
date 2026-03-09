@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Docker Reports Gateway</title>
+<script src="snapshot_list.js"></script>
+<style>
+    body {
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        background-color: #f4f4f4;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        margin: 0;
+    }
+    .card {
+        background: #fffcf0;
+        padding: 40px;
+        border-radius: 12px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        text-align: center;
+        max-width: 400px;
+        width: 100%;
+		border: 1px solid #d3d3d3;
+    }
+    h1 { margin-top: 0; color: #626262; }
+    p { color: #666; margin-bottom: 30px; }
+    .btn {
+        display: inline-block;
+        background-color: #118bba;
+        color: white;
+        padding: 15px 30px;
+        text-decoration: none;
+        border-radius: 6px;
+        font-weight: bold;
+        font-size: 16px;
+        transition: background 0.2s;
+        cursor: pointer;
+        border: none;
+    }
+    .btn:hover { background-color: #00506b; }
+    .footer { margin-top: 20px; font-size: 12px; color: #999; }
+</style>
+</head>
+<body>
+
+<div class="card">
+	<img src="assets/docker_logo.png" style="width: 128px; height: 128px; object-fit: contain;" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2280%22>🐳</text></svg>'">
+    <h1>Docker Reports</h1>
+    <p>Access your latest container snapshot and configuration history.</p>
+    
+    <button class="btn" onclick="openLatest()">Open Latest Report</button>
+    
+    <div class="footer" id="statusText">Checking archives...</div>
+</div>
+
+
+<script>
+    function openLatest() {
+        if (typeof allSnapshots !== 'undefined' && allSnapshots.length > 0) {
+            // Sort to ensure we get the absolute latest (YYYYMMDD format)
+            const latest = [...allSnapshots].sort().reverse()[0];
+            // Redirect to the HTML file inside the latest snapshot folder
+            const url = "./" + latest + "/" + latest + ".html";
+            window.location.href = url;
+        } else {
+            alert("No snapshot reports found! Please run the UserScript first.");
+        }
+    }
+
+    window.onload = function() {
+        const status = document.getElementById('statusText');
+        if (typeof allSnapshots !== 'undefined' && allSnapshots.length > 0) {
+            const latest = [...allSnapshots].sort().reverse()[0];
+            const dateStr = latest.replace('docker_snapshot_', '');
+            const y = dateStr.substr(0,4), m = dateStr.substr(4,2), d = dateStr.substr(6,2);
+            status.innerHTML = "Latest Snapshot Detected: " + m + "/" + d + "/" + y;
+        } else {
+            status.innerHTML = "No archives detected. Please run your Unraid UserScript.";
+            status.style.color = "#b30000";
+        }
+    };
+</script>
+
+
+
+</body>
+</html>

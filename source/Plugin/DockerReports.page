@@ -1,0 +1,16 @@
+Menu="SystemInformation"
+Type="xmenu"
+Tabs="true"
+Title="Docker Reports"
+Icon="docker"
+---
+<style>
+    .docker-reports-frame {
+        width: 100%;
+        height: 88vh;
+        border: none;
+        margin-top: -30px;
+    }
+</style>
+<iframe src="/plugins/DockerDash/data/index.html" class="docker-reports-frame"></iframe>
+

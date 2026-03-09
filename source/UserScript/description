@@ -1,0 +1,1 @@
+Tracks Docker config changes (ports, variables, paths) in a dashboard with a history ledger. Saves .xml file for each and all changes.

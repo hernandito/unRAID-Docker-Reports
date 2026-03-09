@@ -1,0 +1,1223 @@
+#!/bin/bash
+# ==================================
+# Docker Active Templates Snapshot & Audit Dashboard
+# ==================================
+start_time=$SECONDS
+
+# --- USER CONFIGURATION ---
+# 	Path where reports and backups are stored. Strongly recommended you keep this folder, 
+# 	otherwise you will need t manually edit the plugin's .plg file, and possibly ther files as well.
+REPORTS_BASE="/mnt/user/appdata/reports/DockerReports"
+
+# Windows/SMB path for the "Copy Path" feature (Update 'SERVERNAME' to your Unraid name)
+WINDOWS_BASE="\\\\\\\\SERVERNAME\\\\appdata\\\\reports\\\\Docker Reports"
+
+# Retention policy (How many days of history to keep)
+KEEP_DAYS=3650
+
+# Your Unraid WebGUI URL (Including Port if not 80)
+UNRAID_URL="http://192.168.0.201:84/"
+
+# Standard Unraid System Paths (Rarely need changing)
+AUTOSTART_FILE="/var/lib/docker/unraid-autostart"
+
+if [ -f "/boot/config/plugins/ca.update.applications/DockerUpdateSettings.json" ]; then
+    AUTO_UPDATE_FILE="/boot/config/plugins/ca.update.applications/DockerUpdateSettings.json"
+elif [ -f "/boot/config/plugins/community.applications/DockerUpdateSettings.json" ]; then
+    AUTO_UPDATE_FILE="/boot/config/plugins/community.applications/DockerUpdateSettings.json"
+else
+    AUTO_UPDATE_FILE=""
+fi
+
+# --- INTERNAL PATHS & LOGIC ---
+DATE=$(date +%Y%m%d)
+FRIENDLY_DATE=$(date +%B" "%d", "%Y)
+BACKUP_DIR="$REPORTS_BASE/docker_snapshot_$DATE"
+
+declare -A DOCKER_ICONS
+HUMAN_CHANGES=""
+TRIGGER_FULL_BACKUP=false
+
+# 1. CONSOLE LOG (Preserving your original HTML formatting)
+echo ""
+echo "<div style='width: 85%; border-radius: 4px; border: solid 1px #555; background: #555; padding: 8px;'><b><font color='#ffc926' size='3'>🐳 Docker Snapshot Backup</font></b></div>"
+echo "<font color='#00698c'>Active containers only → $BACKUP_DIR</font>"
+echo ""
+
+# --- DYNAMIC HISTORY HELPER (Robust Sync) ---
+log_to_history() {
+    local container_name="$1"
+    local change_type="$2"
+    local change_details="$3"
+    local icon_path="$4"
+    local hist_json="$REPORTS_BASE/assets/docker_history.json"
+    local hist_js="$REPORTS_BASE/assets/docker_history.js"
+    
+    [ ! -s "$hist_json" ] && echo "[]" > "$hist_json"
+    
+    local ts=$(date "+%B %d, %Y %I:%M %p")
+    local sort_id=$(date "+%Y%m%d%H%M%S")
+    local temp_json=$(mktemp)
+    
+    jq --arg c "$container_name" --arg t "$change_type" --arg d "$change_details" --arg i "$icon_path" --arg date "$ts" --argjson sid "$sort_id" '. + [{date: $date, sortID: $sid, container: $c, type: $t, details: $d, icon: $i}]' "$hist_json" > "$temp_json" && mv "$temp_json" "$hist_json"
+    
+    printf "const dockerHistory = " > "$hist_js"
+    cat "$hist_json" >> "$hist_js"
+    printf ";" >> "$hist_js"
+    
+    chmod 666 "$hist_json" "$hist_js"
+    sync
+    echo "&nbsp&nbsp📝 Ledger updated for: <font color='#00698c'><b>$container_name</b></font>"
+}
+
+# --- CLEANING HELPERS ---
+# For the Summary Page (HTML)
+clean_for_summary() {
+    echo "$1" | sed 's/&#x279C;/ ➜ /g; s/&#xD;&#xA;/<br>/g; s/&#xD;/<br>/g; s/&#xA;/<br>/g; s/&amp;/\&/g; s/&quot;/\"/g; s/&#39;/\x27/g'
+}
+
+# For the Ledger Cards (JSON/JS)
+clean_for_ledger() {
+    echo "$1" | sed 's/&#x279C;/ ➜ /g; s/&#xD;&#xA;/\\n/g; s/&#xD;/\\n/g; s/&#xA;/\\n/g; s/&amp;/\&/g; s/&quot;/\"/g; s/&#39;/\x27/g'
+}
+
+
+
+DATE=$(date +%Y%m%d)
+FRIENDLY_DATE=$(date +%B" "%d", "%Y)
+BACKUP_DIR="$REPORTS_BASE/docker_snapshot_$DATE"
+
+# Clean up temp files from previous runs to start fresh
+rm -f "/tmp/snap_sidebar_$DATE.tmp" "/tmp/snap_grid_$DATE.tmp" "/tmp/snap_details_$DATE.tmp" "/tmp/snap_txt_$DATE.tmp" "/tmp/active_xmls_$DATE.txt"
+
+# 1. CONSOLE LOG
+echo ""
+echo "<div style='width: 85%; border-radius: 4px; border: solid 1px #555; background: #555; padding: 8px;'><b><font color='#ffc926' size='3'>🐳 Docker Snapshot Backup</font></b></div>"
+echo "<font color='#00698c'>Active containers only → $BACKUP_DIR</font>"
+echo ""
+
+CONTAINERS=$(docker ps -a --format "{{.Names}}" | sort -f)
+NUM_CONTAINERS=$(echo "$CONTAINERS" | wc -l)
+UNRAID_VER=$(grep version= /etc/unraid-version | cut -d'"' -f2 || echo "N/A")
+
+if [ -n "$AUTO_UPDATE_FILE" ]; then
+    AU_STATUS="<font color='#1f7900'>Found</font>"
+else
+    AU_STATUS="<font color='#b30000'>Missing</font>"
+fi
+echo "<b>🔍 System Checks:</b>"
+echo "• AutoUpdate Config: $AU_STATUS" 
+echo ""
+
+echo "<b>🔍 Active containers (running + stopped):</b>"
+echo "<font color='#1f7900'>$NUM_CONTAINERS containers found</font>"
+echo ""
+
+for c in $CONTAINERS; do
+    ST=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo "unknown")
+    echo "🐳 $c ($ST)"
+done
+
+echo ""
+echo "<b>📂 Backing up active templates...</b>"
+
+# Build the TXT Report into a Temporary File
+cat <<EOF > "/tmp/snap_txt_$DATE.tmp"
+🐳 Docker Snapshot - $DATE
+──────────────────────────────────────────────
+Total Active Containers: $NUM_CONTAINERS
+unRAID Version: $UNRAID_VER
+Backup Location: $BACKUP_DIR/xml
+
+Containers Not Running:
+$(for c in $CONTAINERS; do
+    st=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo "unknown")
+    [ "$st" != "running" ] && echo "• $c ($st)"
+done)
+
+Restore Instructions:
+1. Stop Docker service (Settings → Docker → No → Apply)
+2. Copy XML files to /boot/config/plugins/dockerMan/templates-user/
+3. Restart Docker service (Yes → Apply)
+4. In Docker tab: Add Container → select restored template from dropdown
+──────────────────────────────────────────────
+EOF
+
+# --- START OF SMART LOGIC (DASHBOARD) ---
+DASH_NOT_RUNNING_HTML=""
+NON_RUNNING_DATA=$(docker ps -a --filter "status=exited" --filter "status=created" --filter "status=paused" --filter "status=dead" --format "{{.Names}} ({{.Status}})")
+
+if [ -z "$NON_RUNNING_DATA" ]; then
+    DASH_NOT_RUNNING_HTML="<li>All containers running</li>"
+else
+    while read -r line; do
+        NAME=$(echo "$line" | cut -d' ' -f1)
+        STATE=$(echo "$line" | grep -oP '\(\K[^ )]+' | head -1 | tr '[:upper:]' '[:lower:]')
+        DASH_NOT_RUNNING_HTML+="<li>$NAME ($STATE)</li>"
+    done <<< "$NON_RUNNING_DATA"
+fi
+
+# --- SMART FOLDER SELECTION (FIXED) ---
+# We ONLY consider today a valid backup baseline if the xml folder was successfully created
+if [ -d "$BACKUP_DIR/xml" ]; then
+    LAST_BACKUP="$BACKUP_DIR"
+    echo "Comparing against today's existing snapshot..."
+else
+    LAST_BACKUP=$(find "$REPORTS_BASE" -maxdepth 1 -type d -name "docker_snapshot_*" ! -name "docker_snapshot_$DATE" | sort | tail -n 1)
+    echo "No snapshot today yet. Comparing against: $(basename "$LAST_BACKUP")"
+    
+    # If no folder exists at all, force backup
+    if [ -z "$LAST_BACKUP" ]; then TRIGGER_FULL_BACKUP=true; fi
+fi
+
+# Ensure JS bridge is synced at start of every run
+HISTORY_FILE="$REPORTS_BASE/assets/docker_history.json"
+[ ! -f "$HISTORY_FILE" ] && echo "[]" > "$HISTORY_FILE"
+
+if [ -f "$HISTORY_FILE" ]; then
+    printf "const dockerHistory = " > "$REPORTS_BASE/assets/docker_history.js"
+    cat "$HISTORY_FILE" >> "$REPORTS_BASE/assets/docker_history.js"
+    printf ";" >> "$REPORTS_BASE/assets/docker_history.js"
+    chmod 666 "$REPORTS_BASE/assets/docker_history.js"
+fi
+
+# 4. PROCESSING LOOP
+COPIED=0
+NOT_RUNNING_HTML=""
+OFFLINE_ICONS_HTML=""
+
+
+
+
+
+
+for container in $CONTAINERS; do
+    # --- 1. INITIALIZE & CAPTURE METADATA FIRST ---
+    CURRENT_DOCKER_CHANGES=""
+    SCAN_LEDGER_ENTRIES=""   # Buffer for the JSON Ledger
+    SCAN_SUMMARY_ENTRIES=""  # Buffer for the HTML Summary Page
+    
+    norm=$(echo "$container" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g; s/_/-/g; s/--*/-/g; s/^-//; s/-$//')
+    XML_FILE=""
+    for try in "$norm" "my-$norm" "${norm//-/_}" "my-${norm//-/_}" "${container,,}" "my-${container,,}"; do
+        candidate=$(find /boot/config/plugins/dockerMan/templates-user -type f -iname "*$try*.xml" -print -quit 2>/dev/null)
+        [ -n "$candidate" ] && XML_FILE="$candidate" && break
+    done
+
+    if [ -z "$XML_FILE" ]; then continue; fi
+    
+    FILE_NAME=$(basename "$XML_FILE")
+    echo "$XML_FILE" >> "/tmp/active_xmls_$DATE.txt"
+    
+    # Smart Folder Selection
+    LAST_XML="$LAST_BACKUP/xml/$FILE_NAME"
+    XML_BASE64=$(base64 -w 0 "$XML_FILE")
+    ((COPIED++))
+    
+    # Capture XML Fields
+    NAME=$(sed -n 's/.*<Name>\(.*\)<\/Name>.*/\1/p' "$XML_FILE" | head -1)
+    REPO=$(sed -n 's/.*<Repository>\(.*\)<\/Repository>.*/\1/p' "$XML_FILE")
+    ICON=$(sed -n 's/.*<Icon>\(.*\)<\/Icon>.*/\1/p' "$XML_FILE")
+    NETWORK=$(sed -n 's/.*<Network>\(.*\)<\/Network>.*/\1/p' "$XML_FILE")
+    NET_TYPE=$(sed -n 's/.*<NetworkType>\(.*\)<\/NetworkType>.*/\1/p' "$XML_FILE")
+    USE_TS=$(sed -n 's/.*<Tailscale>\(.*\)<\/Tailscale>.*/\1/p' "$XML_FILE")
+    SHELL_CMD=$(sed -n 's/.*<Shell>\(.*\)<\/Shell>.*/\1/p' "$XML_FILE")
+    EXTRA_PARAMS=$(sed -n 's/.*<ExtraParams>\(.*\)<\/ExtraParams>.*/\1/p' "$XML_FILE")
+    POST_ARGS=$(sed -n 's/.*<PostArgs>\(.*\)<\/PostArgs>.*/\1/p' "$XML_FILE")
+    
+	# Multi-line grab for Overview & Notes (Now formatting carriage returns into real line breaks!)
+    OVERVIEW=$(grep -ozP '(?s)<Overview>\K.*?(?=</Overview>)' "$XML_FILE" | tr -d '\0' | sed 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/\"/g; s/&#39;/\x27/g; s/&#xD;&#xA;/\n/g; s/&#xD;/\n/g; s/&#xA;/\n/g')
+    NOTES=$(grep -ozP '(?s)<Notes>\K.*?(?=</Notes>)' "$XML_FILE" | tr -d '\0' | sed 's/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/\"/g; s/&#39;/\x27/g; s/&#xD;&#xA;/\n/g; s/&#xD;/\n/g; s/&#xA;/\n/g')
+    
+    WEBUI=$(sed -n 's/.*<WebUI>\(.*\)<\/WebUI>.*/\1/p' "$XML_FILE" | sed -E 's/\[PORT:([0-9]+)\]/\1/g')
+    CONFIG_PATH=$(sed -n '/Target="\/config"/s/.*>\([^<]*\)<.*/\1/p' "$XML_FILE" | xargs)
+    STATUS=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || echo "unknown")
+    DOCKER_ICONS["$NAME"]="$ICON"
+
+    # --- 2. RUN SENSORS & ACCUMULATE LOGS ---
+
+    # SENSOR 1: AUTOSTART
+    [ -f "$AUTOSTART_FILE" ] && grep -Fxq "$container" "$AUTOSTART_FILE" && IS_AUTO="Enabled" || IS_AUTO="Disabled"
+    if [ -n "$LAST_BACKUP" ] && [ -f "$LAST_BACKUP/autostart.list" ]; then
+        grep -Fxq "$container" "$LAST_BACKUP/autostart.list" && WAS_AUTO="Enabled" || WAS_AUTO="Disabled"
+        if [ "$WAS_AUTO" != "$IS_AUTO" ]; then
+            TRIGGER_FULL_BACKUP=true
+            SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-autostart'>AutoStart</span> <span class='ledger-text'>updated</span> <div class='ledger-value-change'><span class='change-old'>$WAS_AUTO</span> <span class='change-arrow'>&#10142;</span> <span class='change-new'>$IS_AUTO</span></div></li>"
+            SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-autostart'>AutoStart</span> <span class='sum-text'>updated</span> <div class='summary-value-change'><span class='sum-old'>$WAS_AUTO</span> <span class='sum-arrow'>&#10142;</span> <span class='sum-new'>$IS_AUTO</span></div></li>"
+        fi
+    fi
+
+    # SENSOR 2: AUTOUPDATE
+    if [ -n "$AUTO_UPDATE_FILE" ]; then
+        IS_UP=$(jq -r ".containers[\"$container\"].update" "$AUTO_UPDATE_FILE" 2>/dev/null)
+        [ "$IS_UP" == "true" ] && IS_AUTO_UP="Enabled" && echo "$container" >> "/tmp/current_autoupdate_enabled_$DATE.txt" || IS_AUTO_UP="Disabled"
+        if [ -n "$LAST_BACKUP" ] && [ -f "$LAST_BACKUP/autoupdate.list" ]; then
+            grep -Fxq "$container" "$LAST_BACKUP/autoupdate.list" && WAS_UP="Enabled" || WAS_UP="Disabled"
+            if [ "$WAS_UP" != "$IS_AUTO_UP" ]; then
+                TRIGGER_FULL_BACKUP=true
+                SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-autoupdate'>AutoUpdate</span> <span class='ledger-text'>updated</span> <div class='ledger-value-change'><span class='change-old'>$WAS_UP</span> <span class='change-arrow'>&#10142;</span> <span class='change-new'>$IS_AUTO_UP</span></div></li>"
+                SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-autoupdate'>AutoUpdate</span> <span class='sum-text'>updated</span> <div class='summary-value-change'><span class='sum-old'>$WAS_UP</span> <span class='sum-arrow'>&#10142;</span> <span class='sum-new'>$IS_AUTO_UP</span></div></li>"
+            fi
+        fi
+    fi
+
+	# SENSOR 2.5: NEW CONTAINER DETECTION
+    if [ -n "$LAST_BACKUP" ] && [ ! -f "$LAST_XML" ]; then
+        # Check if we already logged this addition today
+        if ! grep -Fxq "$NAME" "/tmp/added_dockers_$DATE.txt" 2>/dev/null; then
+            echo "$NAME" >> "/tmp/added_dockers_$DATE.txt"
+            TRIGGER_FULL_BACKUP=true
+            SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-added'>Added</span> <span class='ledger-text'>container</span> <div class='ledger-value-change'><span class='change-new'>Installed</span></div></li>"
+            SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-added'>Added</span> <span class='sum-text'>container</span> <div class='summary-value-change'><span class='sum-new'>Installed</span></div></li>"
+        fi
+    fi
+
+
+
+# SENSOR 3: CONFIG AUDIT
+    if [ -n "$LAST_BACKUP" ] && [ -f "$LAST_XML" ]; then
+        source "$REPORTS_BASE/assets/audit_logic.sh"
+        DIFF_DATA=$(compare_configs "$container" "$XML_FILE" "$LAST_XML")
+        if [ -n "$DIFF_DATA" ]; then
+            TRIGGER_FULL_BACKUP=true
+            unset OLD_VALS NEW_VALS TAG_MAP CTX_MAP
+            declare -A OLD_VALS; declare -A NEW_VALS; declare -A TAG_MAP; declare -A CTX_MAP
+            while read -r line; do
+                [ -z "$line" ] && continue
+                PREFIX="${line:0:1}"; RAW_LINE="${line#? }"
+                safe_line=$(echo "$RAW_LINE" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                RAW_LABEL=$(echo "$RAW_LINE" | cut -d':' -f1)
+                MAIN_TAG=$(echo "$RAW_LABEL" | awk '{print $1}')
+                CONTEXT=$(echo "$RAW_LABEL" | cut -d' ' -f2- | tr -d '()')
+                VAL_ONLY=$(echo "${safe_line#*: }")
+                [[ "$MAIN_TAG" == "()" ]] || [[ -z "$CONTEXT" ]] && continue
+                KEY="${MAIN_TAG}_${CONTEXT}"; KEY="${KEY// /_}" 
+                TAG_MAP["$KEY"]="$MAIN_TAG"; CTX_MAP["$KEY"]="$CONTEXT"
+                
+                if [[ "$line" == "< "* ]]; then OLD_VALS["$KEY"]="$VAL_ONLY"; elif [[ "$line" == "> "* ]]; then NEW_VALS["$KEY"]="$VAL_ONLY"; fi
+            done <<< "$DIFF_DATA"
+
+            for KEY in "${!TAG_MAP[@]}"; do
+                M_TAG="${TAG_MAP[$KEY]}"; CTX="${CTX_MAP[$KEY]}"; OLD="${OLD_VALS[$KEY]}"; NEW="${NEW_VALS[$KEY]}"
+                
+                # --- SANITIZE FOR LEDGER ---
+                L_OLD=$(clean_for_ledger "$OLD")
+                L_NEW=$(clean_for_ledger "$NEW")
+                
+                # --- SANITIZE FOR SUMMARY ---
+                S_OLD=$(clean_for_summary "$OLD")
+                S_NEW=$(clean_for_summary "$NEW")
+                
+                TARGET_VAL=$(sed -n "/Name=\"$CTX\"/s/.*Target=\"\([^\"]*\)\".*/\1/p" "$XML_FILE" | head -1)
+                [ -z "$TARGET_VAL" ] && TARGET_VAL=$(sed -n "/Name=\"$CTX\"/s/.*Target=\"\([^\"]*\)\".*/\1/p" "$LAST_XML" | head -1)
+                
+                if [ -n "$TARGET_VAL" ]; then
+                    if [[ "$M_TAG" == "Variable" ]]; then
+                        LEDGER_CTX="$CTX <span class='ledger-key'>($TARGET_VAL)</span>"
+                        SUM_CTX="$CTX <span class='sum-key'>($TARGET_VAL)</span>"
+                    elif [[ "$M_TAG" == "Port" ]]; then
+                        LEDGER_CTX="$CTX <span class='ledger-key'>(Internal: $TARGET_VAL)</span>"
+                        SUM_CTX="$CTX <span class='sum-key'>(Internal: $TARGET_VAL)</span>"
+                    elif [[ "$M_TAG" == "Path" ]]; then
+                        LEDGER_CTX="$CTX <span class='ledger-key'>(Container Path: $TARGET_VAL)</span>"
+                        SUM_CTX="$CTX <span class='sum-key'>(Container Path: $TARGET_VAL)</span>"
+                    fi
+                else
+                    LEDGER_CTX="$CTX"; SUM_CTX="$CTX"
+                fi
+                
+                if [ -n "$OLD" ] && [ -n "$NEW" ]; then
+                    SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-changed'>${M_TAG}</span> <span class='ledger-text'>updated</span> <span class='ledger-name'>${LEDGER_CTX}</span> <div class='ledger-value-change'><span class='change-old'>$L_OLD</span> <span class='change-arrow'>&#10142;</span> <span class='change-new'>$L_NEW</span></div></li>"
+                    SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-changed'>${M_TAG}</span> <span class='sum-text'>updated</span> <span class='sum-name'>${SUM_CTX}</span> <div class='summary-value-change'><span class='sum-old'>$S_OLD</span> <span class='sum-arrow'>&#10142;</span> <span class='sum-new'>$S_NEW</span></div></li>"
+                elif [ -n "$OLD" ]; then
+                    SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-removed'>Removed ${M_TAG}</span> <span class='ledger-name'>${LEDGER_CTX}</span> <div class='ledger-value-change'><span class='change-old'>$L_OLD</span></div></li>"
+                    SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-removed'>Removed ${M_TAG}</span> <span class='sum-name'>${SUM_CTX}</span> <div class='summary-value-change'><span class='sum-old'>$S_OLD</span></div></li>"
+                elif [ -n "$NEW" ]; then
+                    SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-added'>Added ${M_TAG}</span> <span class='ledger-name'>${LEDGER_CTX}</span> <div class='ledger-value-change'><span class='change-new'>$L_NEW</span></div></li>"
+                    SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-added'>Added ${M_TAG}</span> <span class='sum-name'>${SUM_CTX}</span> <div class='summary-value-change'><span class='sum-new'>$S_NEW</span></div></li>"
+                fi
+            done
+        fi
+    fi
+
+
+	# SENSOR 4: TOTAL AWARENESS
+    if [ -n "$LAST_BACKUP" ] && [ -f "$LAST_XML" ]; then
+        OLD_EP=$(sed -n 's/.*<ExtraParams>\(.*\)<\/ExtraParams>.*/\1/p' "$LAST_XML")
+        OLD_PA=$(sed -n 's/.*<PostArgs>\(.*\)<\/PostArgs>.*/\1/p' "$LAST_XML")
+        OLD_NET_NAME=$(sed -n 's/.*<Network>\(.*\)<\/Network>.*/\1/p' "$LAST_XML")
+        OLD_NET_TYPE=$(sed -n 's/.*<NetworkType>\(.*\)<\/NetworkType>.*/\1/p' "$LAST_XML")
+        
+        if [ "$OLD_EP" != "$EXTRA_PARAMS" ]; then
+            TRIGGER_FULL_BACKUP=true
+            L_OLD_EP=$(clean_for_ledger "$OLD_EP"); L_NEW_EP=$(clean_for_ledger "$EXTRA_PARAMS")
+            S_OLD_EP=$(clean_for_summary "$OLD_EP"); S_NEW_EP=$(clean_for_summary "$EXTRA_PARAMS")
+            SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-changed'>ExtraParams</span> <span class='ledger-text'>updated</span> <div class='ledger-value-change'><span class='change-old'>${L_OLD_EP:-None}</span> <span class='change-arrow'>&#10142;</span> <span class='change-new'>${L_NEW_EP:-None}</span></div></li>"
+            SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-changed'>ExtraParams</span> <span class='summary-text'>updated</span> <div class='summary-value-change'><span class='sum-old'>${S_OLD_EP:-None}</span> <span class='sum-arrow'>&#10142;</span> <span class='sum-new'>${S_NEW_EP:-None}</span></div></li>"
+        fi
+        if [ "$OLD_PA" != "$POST_ARGS" ]; then
+            TRIGGER_FULL_BACKUP=true
+            L_OLD_PA=$(clean_for_ledger "$OLD_PA"); L_NEW_PA=$(clean_for_ledger "$POST_ARGS")
+            S_OLD_PA=$(clean_for_summary "$OLD_PA"); S_NEW_PA=$(clean_for_summary "$POST_ARGS")
+            SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-changed'>PostArgs</span> <span class='ledger-text'>updated</span> <div class='ledger-value-change'><span class='change-old'>${L_OLD_PA:-None}</span> <span class='change-arrow'>&#10142;</span> <span class='change-new'>${L_NEW_PA:-None}</span></div></li>"
+            SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-changed'>PostArgs</span> <span class='summary-text'>updated</span> <div class='summary-value-change'><span class='sum-old'>${S_OLD_PA:-None}</span> <span class='sum-arrow'>&#10142;</span> <span class='sum-new'>${S_NEW_PA:-None}</span></div></li>"
+        fi
+        # Network change (Simple text, no special cleaning usually needed here)
+        if [ "$OLD_NET_TYPE" != "$NET_TYPE" ] || [ "$OLD_NET_NAME" != "$NETWORK" ]; then
+             TRIGGER_FULL_BACKUP=true
+             SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-changed'>Network</span> <span class='ledger-text'>changed</span> <div class='ledger-value-change'><span class='change-old'>${OLD_NET_NAME:-N/A} (${OLD_NET_TYPE:-N/A})</span> <span class='change-arrow'>&#10142;</span> <span class='change-new'>$NETWORK ($NET_TYPE)</span></div></li>"
+             SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-changed'>Network</span> <span class='summary-text'>changed</span> <div class='summary-value-change'><span class='sum-old'>${OLD_NET_NAME:-N/A} (${OLD_NET_TYPE:-N/A})</span> <span class='sum-arrow'>&#10142;</span> <span class='sum-new'>$NETWORK ($NET_TYPE)</span></div></li>"
+        fi
+    fi
+
+    # --- 3. WRITE CONSOLIDATED DATA ---
+    if [ -n "$SCAN_LEDGER_ENTRIES" ]; then
+        log_to_history "$NAME" "SYSTEM UPDATE" "$SCAN_LEDGER_ENTRIES" "$ICON"
+    fi
+    
+	if [ -n "$SCAN_SUMMARY_ENTRIES" ]; then
+        HUMAN_CHANGES+="<div class='change-item'><div class='change-header'><a href='$UNRAID_URL/Docker/UpdateContainer?xmlTemplate=edit:$XML_FILE' target='_blank' class='docker-edit-link' title='Edit $NAME in Unraid'><img src='$ICON' class='change-icon'> <strong>$NAME</strong></a> <a href='data:application/xml;base64,$XML_BASE64' download='${NAME}_run_version.xml' class='run-xml-dl'>🠋<i>Download this Version</i></a></div><ul class='change-list'>$SCAN_SUMMARY_ENTRIES</ul></div>"
+    fi
+
+    # --- 4. DATA PACKAGING FOR HTML ---
+    if [ "$STATUS" != "running" ]; then
+        grep -Fxq "$container" "$AUTOSTART_FILE" && TYPE="color-mode" || TYPE="grey-mode"
+        OFFLINE_ICONS_HTML+="<div title='$NAME'><img src='$ICON' class='offline-icon $TYPE'></div>"
+        NOT_RUNNING_HTML+="<li>$NAME ($STATUS)</li>"
+    fi
+
+    PORTS=$(sed -n '/Type="Port"/s/.*Name="\([^"]*\)".*>\([^<]*\)<.*/• \1: \2/p' "$XML_FILE")
+    VOLS=$(sed -n '/Type="Path"/s/.*Name="\([^"]*\)".*>\([^<]*\)<.*/• \1: \2/p' "$XML_FILE")
+    ENVS=$(sed -n '/Type="Variable"/s/.*Name="\([^"]*\)".*>\([^<]*\)<.*/• \1 = \2/p' "$XML_FILE")
+    
+    echo "<a onclick=\"show('$container')\" data-name=\"$NAME\"><img src=\"$ICON\" onerror=\"this.src='https://via.placeholder.com/28?text=?'\"> $NAME</a>" >> "/tmp/snap_sidebar_$DATE.tmp"
+    echo "<a href=\"data:application/xml;base64,$XML_BASE64\" download=\"$FILE_NAME\" class=\"grid-item\"><img src=\"$ICON\" onerror=\"this.src='https://via.placeholder.com/48?text=?'\"><span>$NAME</span></a>" >> "/tmp/snap_grid_$DATE.tmp"
+
+cat <<EOF >> "/tmp/snap_details_$DATE.tmp"
+<div id="$container" class="container detail-view">
+  <div class="dd-split-container">
+      <div class="dd-details-left">
+		<div class="detail-header-wrapper">
+              <div class="detail-header-left">
+                  <a href="$UNRAID_URL/Docker/UpdateContainer?xmlTemplate=edit:$XML_FILE" target="_blank" class="docker-edit-link" title="Edit $NAME in Unraid">
+                      <img src="$ICON"><h2>$NAME</h2>
+                  </a>
+              </div>
+         </div>    
+          <div class="dd-row dd-status"><span class="dd-label">Status:</span> <span class="dd-value">$STATUS</span></div>
+          <div class="dd-row dd-repo"><span class="dd-label">Repository:</span> <span class="dd-value">$REPO</span></div>
+          <div class="dd-row dd-network"><span class="dd-label">Network:</span> <span class="dd-value">$NETWORK ($NET_TYPE)</span></div>
+          <div class="dd-row dd-ts"><span class="dd-label">Tailscale:</span> <span class="dd-value">${USE_TS:-false}</span></div>
+          <div class="dd-row dd-webui"><span class="dd-label">Web UI:</span> <a href="$WEBUI" class="dd-link dd-link-webui" target="_blank">$WEBUI</a></div>
+          <div class="dd-row dd-config"><span class="dd-label">Config Path:</span> <code class="dd-code">${CONFIG_PATH:-N/A}</code></div>
+          <div class="dd-row dd-shell"><span class="dd-label">Console:</span> <code class="dd-code">${SHELL_CMD:-/bin/bash}</code></div>
+          <div class="dd-row dd-support"><span class="dd-label">Support:</span> <a href="$SUPPORT" class="dd-link" target="_blank">$SUPPORT</a></div>
+          <div class="dd-block"><div class="dd-block-label">Overview:</div><pre class="dd-pre" style="white-space: pre-wrap;">${OVERVIEW:-No description provided.}</pre></div>
+          <div class="dd-block" style="${NOTES:+display:block;}${NOTES:-display:none;};"><div class="dd-block-label" style="color:#b30000;">Additional Requirements (Notes):</div><pre class="dd-pre" style="white-space: pre-wrap; background:#fff8f8; border-color:#ffeded; color:#b30000;">$NOTES</pre></div>
+          <div class="dd-block"><div class="dd-block-label">Extra Parameters:</div><pre class="dd-pre">${EXTRA_PARAMS:-None}</pre></div>
+          <div class="dd-block"><div class="dd-block-label">Post Arguments:</div><pre class="dd-pre">${POST_ARGS:-None}</pre></div>
+          <div class="dd-block"><div class="dd-block-label">Ports:</div><pre class="dd-pre">${PORTS:-N/A}</pre></div>
+          <div class="dd-block"><div class="dd-block-label">Volumes:</div><pre class="dd-pre">${VOLS:-N/A}</pre></div>
+          <div class="dd-block"><div class="dd-block-label">Env Vars:</div><pre class="dd-pre">${ENVS:-N/A}</pre></div>
+      </div>
+      <div class="dd-history-right">
+          <div data-ledger-for='$NAME'><div style='color:#999; font-style:italic; font-size:12px; padding:15px; text-align:center;'>Loading Ledger...</div></div>
+      </div>
+  </div>
+</div>
+EOF
+done
+
+# --- 5. DETECT DELETED CONTAINERS ---
+if [ -n "$LAST_BACKUP" ] && [ -d "$LAST_BACKUP/xml" ]; then
+    for old_xml in "$LAST_BACKUP/xml/"*.xml; do
+        [ -e "$old_xml" ] || continue
+        old_filename=$(basename "$old_xml")
+        
+        if ! grep -Fq "$old_filename" "/tmp/active_xmls_$DATE.txt" 2>/dev/null; then
+            DEL_NAME=$(sed -n 's/.*<Name>\(.*\)<\/Name>.*/\1/p' "$old_xml" | head -1 | tr -d '\r\n')
+            DEL_ICON=$(sed -n 's/.*<Icon>\(.*\)<\/Icon>.*/\1/p' "$old_xml" | head -1 | tr -d '\r\n')
+            
+            [ -z "$DEL_NAME" ] && continue
+            if grep -Fxq "$DEL_NAME" "/tmp/deleted_dockers_$DATE.txt" 2>/dev/null; then continue; fi
+            echo "$DEL_NAME" >> "/tmp/deleted_dockers_$DATE.txt"
+
+            SAFE_NAME=$(echo "$DEL_NAME" | sed 's/"/\\"/g')
+            SAFE_ICON=$(echo "$DEL_ICON" | sed 's/"/\\"/g')
+            TRIGGER_FULL_BACKUP=true
+            
+            # Ledger Entry
+            DEL_LEDGER="<li><span class='ledger-pill label-removed'>Removed</span> <span class='ledger-text'>container</span> <div class='ledger-value-change'><span class='change-old'>Uninstalled/Deleted</span></div></li>"
+            log_to_history "$SAFE_NAME" "SYSTEM UPDATE" "$DEL_LEDGER" "$SAFE_ICON"
+            
+            # Clean Summary Card using CSS classes
+            HUMAN_CHANGES+="<div class='change-item change-item-removed'>"
+            HUMAN_CHANGES+="<div class='change-header'>"
+            HUMAN_CHANGES+="<img src='$SAFE_ICON' class='change-icon'> "
+            HUMAN_CHANGES+="<strong class='docker-name-removed'>$SAFE_NAME</strong>"
+            HUMAN_CHANGES+="</div>"
+            HUMAN_CHANGES+="<ul class='change-list'><li><span class='summary-pill sum-label-removed'>Removed</span> <span class='sum-text'>container</span> <div class='summary-value-change'><span class='sum-old'>Uninstalled/Deleted</span></div></li></ul></div>"
+        fi
+    done
+fi
+
+# --- BRIDGE SYNC (Safe Edition) ---
+if [ -f "$REPORTS_BASE/assets/docker_history.json" ]; then
+    printf "const dockerHistory = " > "$REPORTS_BASE/assets/docker_history.js"
+    cat "$REPORTS_BASE/assets/docker_history.json" >> "$REPORTS_BASE/assets/docker_history.js"
+    printf ";" >> "$REPORTS_BASE/assets/docker_history.js"
+    chmod 666 "$REPORTS_BASE/assets/docker_history.js"
+    sync
+fi
+
+
+
+# --- DETECT APPDATA BACKUP STATUS ---
+LAST_LOG="/tmp/appdata.backup/ab.log"
+BACKUP_DAYS_LIMIT=2
+
+if [ -f "$LAST_LOG" ]; then
+    BACKUP_DISPLAY_DATE=$(date -r "$LAST_LOG" +"%-m/%-d/%Y")
+    CURRENT_DATE_SEC=$(date +%s)
+    BACKUP_DATE_SEC=$(date -r "$LAST_LOG" +%s)
+    DIFF_DAYS=$(( (CURRENT_DATE_SEC - BACKUP_DATE_SEC) / 86400 ))
+    BACKUP_DATE_STYLE=$([ "$DIFF_DAYS" -ge "$BACKUP_DAYS_LIMIT" ] && echo "font-size: 18px; color: #b30000; padding-right: 4px;" || echo "color: #00698c;")
+    
+    # Capture lines with errors or warnings
+    MISSED_DATA=$(grep -aE "(\[❌\]|\[⚠️\])" "$LAST_LOG" | grep -v "Main")
+    
+    MISSED_ICONS_HTML=""
+    # Use a while loop to process the full lines so we can extract the message
+    while read -r RAW_LINE; do
+        [ -z "$RAW_LINE" ] && continue
+        
+        # Extract the container name (it's between the 5th and 6th bracket in CA Backup logs)
+        missed=$(echo "$RAW_LINE" | awk -F'[][]' '{print $6}')
+        
+        # --- HUMAN FRIENDLY TOOLTIP LOGIC ---
+        # 1. Strip everything up to the final "] " to get the raw message
+        # 2. Add your custom friendly text
+        CLEAN_BASE_MSG=$(echo "$RAW_LINE" | sed 's/.*\] //')
+        FRIENDLY_TOOLTIP="${CLEAN_BASE_MSG} volume to back up! Skipping. Please consider ignoring this container."
+        # Escape quotes for HTML attribute safety
+        FRIENDLY_TOOLTIP=$(echo "$FRIENDLY_TOOLTIP" | sed "s/'/\&apos;/g; s/\"/\&quot;/g")
+
+        MISSED_LOWER=$(echo "$missed" | tr '[:upper:]' '[:lower:]')
+        REAL_ICON="${DOCKER_ICONS[$missed]}" # Try exact name first
+        [ -z "$REAL_ICON" ] && REAL_ICON="${DOCKER_ICONS[$MISSED_LOWER]}" # Try lowercase
+
+        if [ -n "$REAL_ICON" ]; then
+            ICON_DISPLAY="<img src='$REAL_ICON' class='backup-icon-img'>"
+        else
+            ICON_DISPLAY="<div class='backup-error-icon'>!</div>"
+        fi
+        
+        # Inject the friendly tooltip into the 'title' attribute
+        MISSED_ICONS_HTML+="<a href='$UNRAID_URL/Settings/AB.Main' target='_blank' rel='noreferrer' title='⚠️ $FRIENDLY_TOOLTIP'>$ICON_DISPLAY</a>"
+    done <<< "$MISSED_DATA"
+else
+    BACKUP_DISPLAY_DATE="Log not found"
+    BACKUP_DATE_STYLE="color: #b30000;"
+fi
+
+
+ARCHIVE_HTML="<div class='archive-tree'>
+    <div id='tree-container'></div>
+
+    <div class='archive-search-group'>
+        <div class='search-input-wrapper'>
+            <input type='text' id='dockerArchiveSearch' class='archive-search-input' placeholder='Search Docker history...' onkeyup='handleSearchInput(event)' autocomplete='off'>
+            <div id='searchSuggestions' class='search-suggestions-box'></div>
+        </div>
+        <button id='clearSearch' class='archive-search-clear-btn' onclick='clearArchiveSearch()' style='display:none;'>Clear</button>
+    </div>
+    <div id='searchStatus' class='search-status-text' style='display:none;'></div>
+</div>"
+
+
+
+# ==================================
+# FINAL FILE WRITING (ONLY IF CHANGES DETECTED)
+# ==================================
+if [ -n "$LAST_BACKUP" ] && [ "$LAST_BACKUP" != "$BACKUP_DIR" ]; then
+    if [ ! -f "$LAST_BACKUP/autostart.list" ] || [ ! -f "$LAST_BACKUP/autoupdate.list" ]; then
+        TRIGGER_FULL_BACKUP=true
+        ALIGNMENT_CARD="<div class='change-item' style='border-left: 8px solid #00698c;'><div class='change-header'>ℹ️ <strong>System Alignment</strong></div><div class='change-description'>Establishing baseline for AutoStart and AutoUpdate tracking. Future changes will be logged here.</div></div>"
+        HUMAN_CHANGES="$ALIGNMENT_CARD $HUMAN_CHANGES"
+    fi
+fi
+
+if [ "$TRIGGER_FULL_BACKUP" = true ]; then
+    echo "Changes detected! Finalizing snapshot folder..."
+	echo " "
+    mkdir -p "$BACKUP_DIR/xml"
+    FRAGMENT_FILE="$BACKUP_DIR/changes_fragment.html"
+    
+    if [ -f "$FRAGMENT_FILE" ]; then
+        OLD_HISTORY=$(cat "$FRAGMENT_FILE")
+        NEW_HEADER="<div class='run-header'>Script Run <span class='run-time'>- Detected at $(date +"%-I:%M %p")</span></div>"
+        CURRENT_RUN_WRAPPED="<div class='run-section subsequent'>$NEW_HEADER $HUMAN_CHANGES</div>"
+        FULL_CHANGE_LOG="$CURRENT_RUN_WRAPPED $OLD_HISTORY"
+    else
+        INITIAL_HEADER="<div class='run-header'>Initial Scan</div>"
+        FULL_CHANGE_LOG="<div class='run-section initial'>$INITIAL_HEADER $HUMAN_CHANGES</div>"
+    fi
+    
+    echo "$FULL_CHANGE_LOG" > "$FRAGMENT_FILE"
+    cat "$AUTOSTART_FILE" > "$BACKUP_DIR/autostart.list" 2>/dev/null
+    
+    if [ -f "/tmp/current_autoupdate_enabled_$DATE.txt" ]; then
+        mv "/tmp/current_autoupdate_enabled_$DATE.txt" "$BACKUP_DIR/autoupdate.list"
+    else
+        touch "$BACKUP_DIR/autoupdate.list"
+    fi
+    HUMAN_CHANGES="$FULL_CHANGE_LOG"
+
+    # BUILD THE HTML FILE SAFELY
+cat << 'EOF' > "$BACKUP_DIR/docker_snapshot_$DATE.html"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Docker Snapshot - $DATE</title>
+<script src="../snapshot_list.js"></script>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐳</text></svg>">
+<link rel="stylesheet" href="../assets/styles.css?v=$(date +%s)">
+<script src="../assets/docker_history.js?v=$(date +%s)"></script>
+<style>
+    .dash-wrapper, .summary-wrapper { display: flex; gap: 20px; width: 100%; box-sizing: border-box; }
+    .dash-column-left, .summary-left { flex: 1; min-width: 0; width: auto; }
+    .dash-column-right, .summary-right { flex: 0 0 360px; max-width: 360px; min-width: 360px; }
+    .change-values-row { word-break: break-word; overflow-wrap: anywhere; }
+    
+    .ledger-time-barrier span { background: #f8f9fa; padding: 0 12px; position: relative; top: -12px; font-size: 10px; color: #00698c; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; }
+    @media (max-width: 1000px) {
+        .dash-wrapper, .summary-wrapper { flex-direction: column; }
+        .dash-column-right, .summary-right { flex: 1; max-width: 100%; min-width: 100%; margin-top: 10px; }
+    }
+</style>
+</head>
+
+
+
+<body>
+<div class="sidebar">
+  <div class="sidebar-header">
+    <div class="logo-area" onclick="goHome()">
+      <img src="../assets/docker_logo.png" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22><path fill=%22%23666%22 d=%22M3,15H21V17H3V15M3,11H21V13H3V11M3,7H21V9H3V7Z%22/></svg>'">
+      <a class='home-button-menu' href='../index.html' title='Docker Report Home Page'><h2>Containers</h2></a>
+    </div>
+    <input type="text" id="searchInput" class="search-box" placeholder="Search..." onkeyup="filterList()">
+    
+    <label class="deleted-toggle-label">
+        <input type="checkbox" id="showDeletedToggle" onchange="toggleDeleted()"> Show deleted containers
+    </label>
+    
+  </div>
+  <div class="container-list" id="sidebarList">
+EOF
+    
+    cat "/tmp/snap_sidebar_$DATE.tmp" >> "$BACKUP_DIR/docker_snapshot_$DATE.html" 2>/dev/null
+    
+    cat <<EOF >> "$BACKUP_DIR/docker_snapshot_$DATE.html"
+  </div>
+  
+
+  
+</div>
+
+
+
+
+
+<div class="main">
+    <div class="title-row">
+        <h1>Docker Management Dashboard</h1>
+        <div style="display:flex; gap:20px;">
+            <svg title="Copy Windows Path" onclick="copyPath()" class="copy-btn" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            <svg title="Home" onclick="goHome()" class="copy-btn" viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"></path></svg>
+        </div>
+    </div>
+
+<div class="dash-wrapper">
+        <div class="dash-column-left">
+            <h2 class="dash-header">Current Status <span class="dash-pill">Audit Mode Active</span></h2>
+            <div class="dash-stat-row"><strong>unRAID Version:</strong> <span class="unraid-ver-tag">$UNRAID_VER</span></div>
+            <div class="dash-stat-row"><strong>Docker Service:</strong> <span class="dash-status-active">active</span></div>
+            <div class="dash-stat-row" id="appdatabackup"><strong>Appdata Backup:</strong> <span style="$BACKUP_DATE_STYLE">$BACKUP_DISPLAY_DATE</span> $MISSED_ICONS_HTML</div>
+        </div>
+        <div class="dash-column-right">
+            <h2 class="dash-header" id="offdockers">Live Intelligence</h2>
+            <div id="offline-zone" class="dash-stat-row" style="border-bottom:none; margin-top:15px;">
+                <strong>stopped containers:</strong>
+                <div class="offline-grid">$OFFLINE_ICONS_HTML</div>
+            </div>
+        </div>
+    </div>
+
+
+
+	<div id="summary-section" class="summary-wrapper">
+        <div class="summary-left">
+            <h2 class="summary-header">Docker Snapshot <span style="font-weight: normal; color: #b30000; margin-left: 5px;">$FRIENDLY_DATE</span></h2>
+            <div class="summary-stat-row"><strong>Total Containers:</strong> $NUM_CONTAINERS</div>
+            <div class="summary-stat-row"><strong>unRAID Version:</strong> $UNRAID_VER</div>
+            <div class="summary-stat-row" style="border-bottom:none; margin-bottom:0;"><strong>Containers Not Running:</strong></div>
+            <div class="summary-not-running-box"><ul>${NOT_RUNNING_HTML:-<li>All containers running</li>}</ul></div>
+            
+            <div class="summary-stat-row" style="border-bottom:none; margin-top:10px;">
+                <strong>Restore Instructions:</strong>
+                <div class="summary-restore-box">
+                    1. Stop Docker service (Settings &rarr; Docker &rarr; No &rarr; Apply)<br>
+                    2. Copy XMLs to <b>/boot/config/plugins/dockerMan/templates-user/</b><br>
+                    3. Restart Docker and <b>Add Container</b> from template.
+                </div>
+            </div>
+
+            <div id="modified-dockers-header" style="${HUMAN_CHANGES:+display:block;}${HUMAN_CHANGES:-display:none;}; border-bottom:none; margin-top:10px;" class="summary-stat-row">
+                <strong>Configuration Changes Detected:</strong>
+            </div>
+            
+            <div id="modified-dockers-box" class="summary-changes-box" style="${HUMAN_CHANGES:+display:block;}${HUMAN_CHANGES:-display:none;};">
+                $HUMAN_CHANGES
+            </div>
+        </div>
+
+        <div class="summary-right ">
+ 			<div class='archive-header-row'>
+				<h2 class='summary-header' style='margin:0;'>Backup Dates</h2>
+				<button onclick='goLatest()' class='latest-btn-mini'>Latest</button>
+			</div>
+            $ARCHIVE_HTML
+        </div>
+    </div>
+	
+	
+	
+    <div id="grid-page" class="grid-container">
+        <div style="grid-column: 1 / -1; border-bottom: 2px solid #eee; margin-bottom: 10px;"><h2 style="color: #00698c; margin: 0;">Template Downloads</h2></div>
+EOF
+
+    cat "/tmp/snap_grid_$DATE.tmp" >> "$BACKUP_DIR/docker_snapshot_$DATE.html" 2>/dev/null
+    echo "    </div>" >> "$BACKUP_DIR/docker_snapshot_$DATE.html"
+    cat "/tmp/snap_details_$DATE.tmp" >> "$BACKUP_DIR/docker_snapshot_$DATE.html" 2>/dev/null
+
+    cat <<EOF >> "$BACKUP_DIR/docker_snapshot_$DATE.html"
+</div>
+
+
+
+<script>
+const currentReportDate = '$DATE';
+
+/** * NAVIGATION & VIEW TOGGLING 
+ */
+function goHome() {
+    document.querySelectorAll('.detail-view').forEach(function(el) { el.style.display = 'none'; });
+    var summary = document.getElementById('summary-section');
+    var grid = document.getElementById('grid-page');
+    if (summary) summary.style.display = 'flex';
+    if (grid) grid.style.display = 'grid';
+}
+
+function show(id) {
+    if (document.getElementById('summary-section')) document.getElementById('summary-section').style.display = 'none';
+    if (document.getElementById('grid-page')) document.getElementById('grid-page').style.display = 'none';
+    document.querySelectorAll('.detail-view').forEach(function(el) { el.style.display = 'none'; });
+    var target = document.getElementById(id);
+    if (target) target.style.display = 'block';
+}
+
+function showDeleted(name) {
+    var summary = document.getElementById('summary-section');
+    if (summary) summary.style.display = 'none';
+    var grid = document.getElementById('grid-page');
+    if (grid) grid.style.display = 'none';
+    document.querySelectorAll('.detail-view').forEach(function(el) { el.style.display = 'none'; });
+    var targetId = 'ghost-' + name.replace(/[^a-zA-Z0-9_-]/g, '');
+    var target = document.getElementById(targetId);
+    if (target) target.style.display = 'block';
+}
+
+/** * SIDEBAR FILTERING 
+ */
+function filterList() {
+    var filter = document.getElementById('searchInput').value.toLowerCase();
+    var allItems = document.querySelectorAll('#sidebarList a');
+    var showDeletedChecked = document.getElementById('showDeletedToggle').checked;
+
+    allItems.forEach(function(item) {
+        var name = item.getAttribute('data-name').toLowerCase();
+        var isDeleted = item.classList.contains('is-deleted');
+        var matchesSearch = name.indexOf(filter) > -1;
+        
+        if (isDeleted) {
+            if (showDeletedChecked && matchesSearch) {
+                item.classList.remove('collapsed-deleted');
+            } else {
+                item.classList.add('collapsed-deleted');
+            }
+        } else {
+            item.style.display = matchesSearch ? "flex" : "none";
+        }
+    });
+}
+
+function toggleDeleted() { 
+    filterList(); 
+}
+
+/** * ACCORDION LOGIC
+ * Modified to allow multiple months but only one year.
+ */
+function handleAccordion(clickedElement, containerSelector) {
+    var isOpen = clickedElement.open;
+    
+    // Years stay exclusive (one at a time)
+    if (containerSelector === '.year-node') {
+        var allSiblings = clickedElement.parentElement.querySelectorAll(containerSelector);
+        if (!isOpen) {
+            allSiblings.forEach(function(sib) {
+                if (sib !== clickedElement && sib.open) {
+                    sib.classList.add('collapsing');
+                    setTimeout(function() { 
+                        sib.open = false; 
+                        sib.classList.remove('collapsing'); 
+                    }, 400);
+                }
+            });
+            clickedElement.open = true;
+        } else {
+            clickedElement.classList.add('collapsing');
+            setTimeout(function() { 
+                clickedElement.open = false; 
+                clickedElement.classList.remove('collapsing'); 
+            }, 400);
+        }
+    } else {
+        // Months toggle independently (allow multiple)
+        clickedElement.open = !isOpen;
+    }
+}
+
+/** * ARCHIVE SEARCH & FILTERING 
+ */
+function handleSearchInput(e) {
+    var input = document.getElementById('dockerArchiveSearch');
+    var suggestions = document.getElementById('searchSuggestions');
+    var clearBtn = document.getElementById('clearSearch');
+    var val = input.value.toLowerCase();
+
+    clearBtn.style.display = (val.length > 0) ? 'block' : 'none';
+
+    if (val.length < 2) {
+        suggestions.style.display = 'none';
+        if (val.length === 0) clearArchiveSearch();
+        return;
+    }
+
+    var names = new Set();
+    if (typeof dockerHistory !== 'undefined') {
+        dockerHistory.forEach(function(item) { if (item.container) names.add(item.container); });
+    }
+    document.querySelectorAll('#sidebarList a').forEach(function(a) {
+        var n = a.getAttribute('data-name');
+        if (n) names.add(n);
+    });
+
+    var matches = Array.from(names).filter(function(name) {
+        return name.toLowerCase().indexOf(val) > -1;
+    }).sort();
+
+    if (matches.length > 0) {
+        suggestions.innerHTML = '';
+        matches.forEach(function(match) {
+            var div = document.createElement('div');
+            div.className = 'suggestion-item';
+            div.innerText = match;
+            div.onclick = function() { executeGlobalSearch(match); };
+            suggestions.appendChild(div);
+        });
+        suggestions.style.display = 'block';
+    } else {
+        suggestions.style.display = 'none';
+    }
+}
+
+function executeGlobalSearch(dockerName) {
+    var input = document.getElementById('dockerArchiveSearch');
+    var suggestions = document.getElementById('searchSuggestions');
+    var status = document.getElementById('searchStatus');
+    var tree = document.getElementById('tree-container');
+    
+    input.value = dockerName;
+    suggestions.style.display = 'none';
+    status.style.display = 'block';
+    status.innerText = "Showing history for: " + dockerName;
+
+    var foundSnapshots = new Set();
+    if (typeof dockerHistory !== 'undefined') {
+        dockerHistory.forEach(function(item) {
+            if (item.container === dockerName) {
+                var snapName = "docker_snapshot_" + item.sortID.toString().substring(0, 8);
+                foundSnapshots.add(snapName);
+            }
+        });
+    }
+
+    tree.querySelectorAll('.day-chip').forEach(function(chip) {
+        var href = chip.getAttribute('href');
+        var snapFolder = href.split('/')[1];
+
+        if (foundSnapshots.has(snapFolder)) {
+            chip.style.display = 'flex'; // Centering fix
+            chip.classList.add('active-search-match');
+            chip.href = '../' + snapFolder + '/' + snapFolder + '.html?find=' + encodeURIComponent(dockerName);
+        } else {
+            chip.style.display = 'none';
+        }
+    });
+
+    // Expand Years and all matching Months
+    tree.querySelectorAll('.year-node').forEach(function(node) {
+        var visibleChildren = node.querySelectorAll('.day-chip[style*="flex"]');
+        node.style.display = visibleChildren.length > 0 ? 'block' : 'none';
+        if (visibleChildren.length > 0) node.open = true;
+    });
+
+    tree.querySelectorAll('.month-node').forEach(function(node) {
+        var visibleChildren = node.querySelectorAll('.day-chip[style*="flex"]');
+        node.style.display = visibleChildren.length > 0 ? 'block' : 'none';
+        if (visibleChildren.length > 0) node.open = true; // Open all matches
+    });
+}
+
+function clearArchiveSearch() {
+    var input = document.getElementById('dockerArchiveSearch');
+    input.value = '';
+    document.getElementById('searchSuggestions').style.display = 'none';
+    document.getElementById('searchStatus').style.display = 'none';
+    document.getElementById('clearSearch').style.display = 'none';
+    
+    var tree = document.getElementById('tree-container');
+    tree.querySelectorAll('.day-chip, .month-node, .year-node').forEach(function(el) {
+        el.style.display = '';
+        el.classList.remove('active-search-match');
+        if (el.tagName === 'A') {
+            var folder = el.getAttribute('href').split('/')[1];
+            el.href = '../' + folder + '/' + folder + '.html';
+        }
+    });
+}
+
+/** * BUILD ARCHIVE TREE 
+ */
+function buildTree() {
+    var container = document.getElementById('tree-container');
+    if (!container || typeof allSnapshots === 'undefined') return;
+    
+    var urlParams = new URLSearchParams(window.location.search);
+    var currentFind = urlParams.get('find');
+
+    var treeData = {};
+    allSnapshots.forEach(function(snap) {
+        var y = snap.substring(16, 20), m = snap.substring(20, 22);
+        if (!treeData[y]) treeData[y] = {};
+        if (!treeData[y][m]) treeData[y][m] = [];
+        treeData[y][m].push(snap);
+    });
+
+    container.innerHTML = '';
+    var curY = currentReportDate.substring(0, 4);
+    var curM = currentReportDate.substring(4, 6);
+
+    Object.keys(treeData).sort(function(a, b) { return b - a; }).forEach(function(year) {
+        var yearDet = document.createElement('details');
+        yearDet.className = 'year-node';
+        yearDet.open = (year === curY);
+        var yearSum = document.createElement('summary');
+        yearSum.innerHTML = '<span>' + year + '</span>';
+        yearSum.onclick = function(e) { e.preventDefault(); handleAccordion(yearDet, '.year-node'); };
+        
+        var yearContent = document.createElement('div');
+        Object.keys(treeData[year]).sort(function(a, b) { return b - a; }).forEach(function(month) {
+            var mNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+            var monthDet = document.createElement('details');
+            monthDet.className = 'month-node';
+            monthDet.open = (year === curY && month === curM);
+            var monthSum = document.createElement('summary');
+            monthSum.innerText = mNames[parseInt(month)-1];
+            monthSum.onclick = function(e) { e.preventDefault(); handleAccordion(monthDet, '.month-node'); };
+            
+            var widgetContent = document.createElement('div');
+            var widgetHeader = document.createElement('div');
+            widgetHeader.className = 'month-header-widget';
+            widgetHeader.innerHTML = '<span>' + mNames[parseInt(month)-1] + '<span class="year-text">' + year + '</span></span><span>▼</span>';
+            widgetHeader.onclick = function(e) { e.stopPropagation(); handleAccordion(monthDet, '.month-node'); };
+            
+            var grid = document.createElement('div');
+            grid.className = 'day-grid';
+            treeData[year][month].sort(function(a, b) { return parseInt(a.substring(22, 24)) - parseInt(b.substring(22, 24)); }).forEach(function(snap) {
+                var dString = snap.substring(16);
+                var day = parseInt(dString.substring(6, 8), 10);
+                var a = document.createElement('a');
+                a.className = 'day-chip' + (dString === currentReportDate ? ' active-day' : '');
+                
+                if (currentFind) {
+                    a.href = '../' + snap + '/' + snap + '.html?find=' + encodeURIComponent(currentFind);
+                } else {
+                    a.href = '../' + snap + '/' + snap + '.html';
+                }
+                
+                a.innerText = day;
+                grid.appendChild(a);
+            });
+            
+            widgetContent.appendChild(widgetHeader);
+            widgetContent.appendChild(grid);
+            monthDet.appendChild(monthSum);
+            monthDet.appendChild(widgetContent);
+            yearContent.appendChild(monthDet);
+        });
+        yearDet.appendChild(yearSum);
+        yearDet.appendChild(yearContent);
+        container.appendChild(yearDet);
+    });
+}
+
+/** * LEDGER & MISC UTILS 
+ */
+function renderLedger() {
+    if (typeof dockerHistory === 'undefined') return;
+    var reportLimit = parseInt(currentReportDate + "235959");
+    document.querySelectorAll('[data-ledger-for]').forEach(function(container) {
+        var cName = container.getAttribute('data-ledger-for');
+        var cData = dockerHistory.filter(function(item) { return item.container === cName; }).sort(function(a, b) { return (b.sortID || 0) - (a.sortID || 0); });
+        var html = '<div class="history-title">Activity Ledger</div>';
+        if (cData.length === 0) {
+            html += '<div style="color:#999; font-style:italic; font-size:12px; padding:15px; text-align:center;">No history found.</div>';
+        } else {
+            var futureCardsEncountered = false;
+            var barrierShown = false;
+            cData.forEach(function(item) {
+                var itemSortID = item.sortID || 0;
+                var isFuture = itemSortID > reportLimit;
+                if (isFuture) futureCardsEncountered = true;
+                if (!isFuture && futureCardsEncountered && !barrierShown) {
+                    html += '<div class="ledger-time-barrier"><span>🠉 Future Changes 🠉</span></div>';
+                    barrierShown = true;
+                }
+                var cardClass = isFuture ? ' ledger-card-future' : '';
+                html += '<div class="ledger-card' + cardClass + '"><div class="ledger-header"><span class="ledger-type-pill type-' + item.type.split(" ")[0].toLowerCase() + '">' + item.type + '</span><span class="ledger-date">' + item.date + '</span></div><div class="ledger-details"><ul>' + item.details + '</ul></div></div>';
+            });
+        }
+        container.innerHTML = html;
+    });
+}
+
+function buildDeletedList() {
+    if (typeof dockerHistory === 'undefined') return;
+    var sidebarList = document.getElementById('sidebarList');
+    var activeNodes = Array.prototype.slice.call(sidebarList.querySelectorAll('a'));
+    var activeNames = new Set(activeNodes.map(function(a) { return a.getAttribute('data-name'); }));
+    var historyNames = new Set(dockerHistory.map(function(item) { return item.container; }));
+    var deletedNames = Array.from(historyNames).filter(function(name) { return !activeNames.has(name); });
+    var mainContent = document.querySelector('.main');
+    var allNodes = activeNodes.slice();
+
+    deletedNames.forEach(function(name) {
+        var cData = dockerHistory.filter(function(item) { return item.container === name; }).sort(function(a, b) { return (b.sortID || 0) - (a.sortID || 0); });
+        var lastEntry = cData[0];
+        var dateStr = lastEntry && lastEntry.date ? lastEntry.date.split(' ').slice(0, 3).join(' ') : "Unknown";
+        var icon = lastEntry ? lastEntry.icon : 'https://via.placeholder.com/28?text=?';
+        var safeHTMLName = name.replace(/"/g, '&quot;');
+        
+        var a = document.createElement('a');
+        a.className = 'deleted-item is-deleted collapsed-deleted';
+        a.setAttribute('data-name', name);
+        a.onclick = function() { showDeleted(name); };
+        a.innerHTML = '<img src="' + icon + '"> <div style="display:flex; flex-direction:column;"><span>' + name + '</span><span class="deleted-date">Deleted: ' + dateStr + '</span></div>';
+        allNodes.push(a);
+
+        var ghostId = 'ghost-' + name.replace(/[^a-zA-Z0-9_-]/g, '');
+        var ghostCard = document.createElement('div');
+        ghostCard.id = ghostId;
+        ghostCard.className = 'container detail-view ghost-view';
+        ghostCard.style.display = 'none';
+        ghostCard.innerHTML = '<div class="dd-split-container"><div class="dd-details-left"><div class="detail-header-wrapper detail-header-ghost"><div class="detail-header-left"><img src="' + icon + '"><h2>' + name + ' <span class="badge-deleted">⚠️ This Docker has been DELETED! </span></h2></div></div><div class="offline-state"><p>This container is no longer installed.</p><p style="color:#999; font-size:12px;">Historical settings are safely archived.</p><button class="config-load-btn" onclick="loadHistoricalConfig(\'' + safeHTMLName + '\', this)">📥 Load Last Known Config</button></div></div><div class="dd-history-right"><div data-ledger-for="' + safeHTMLName + '"></div></div></div>';
+        mainContent.appendChild(ghostCard);
+    });
+
+    allNodes.sort(function(a, b) { return a.getAttribute('data-name').toLowerCase().localeCompare(b.getAttribute('data-name').toLowerCase()); });
+    sidebarList.innerHTML = '';
+    allNodes.forEach(function(node) { sidebarList.appendChild(node); });
+}
+
+async function loadHistoricalConfig(containerName, btnElement) {
+    btnElement.innerText = "Searching Archives...";
+    btnElement.disabled = true;
+    var xmlText = null, foundSnap = null, finalFileName = null;
+    var snaps = typeof allSnapshots !== 'undefined' ? allSnapshots.slice().sort().reverse() : [];
+    var currentUrl = window.location.href;
+    var baseUrl = currentUrl.substring(0, currentUrl.lastIndexOf('/'));
+    var pluginDataRoot = baseUrl.substring(0, baseUrl.lastIndexOf('/'));
+    var variations = [containerName + '.xml', 'my-' + containerName + '.xml'];
+
+    for (var i = 0; i < snaps.length; i++) {
+        var snap = snaps[i];
+        if (snap.indexOf(currentReportDate) > -1) continue;
+        for (var j = 0; j < variations.length; j++) {
+            var fileVariation = variations[j];
+            var fetchUrl = pluginDataRoot + '/' + snap + '/xml/' + fileVariation;
+            try {
+                var response = await fetch(fetchUrl);
+                if (response.ok) {
+                    xmlText = await response.text();
+                    foundSnap = snap; finalFileName = fileVariation;
+                    break; 
+                }
+            } catch (e) { console.error("Fetch error", e); }
+        }
+        if (xmlText) break;
+    }
+    
+    if (!xmlText) {
+        alert("Search Failed.\nChecked: " + variations.join(', '));
+        btnElement.innerText = "❌ Not Found";
+        setTimeout(function() { btnElement.innerText = "📥 Load Last Known Config"; btnElement.disabled = false; }, 3000);
+        return;
+    }
+
+    var parser = new DOMParser();
+    var xmlDoc = parser.parseFromString(xmlText, "text/xml");
+    var getTagText = function(tag) { var el = xmlDoc.getElementsByTagName(tag)[0]; return el ? el.textContent : 'N/A'; };
+
+    var ports = '', envs = '', vols = '';
+    var configs = xmlDoc.getElementsByTagName('Config');
+    for(var k=0; k < configs.length; k++) {
+        var c = configs[k], type = c.getAttribute('Type'), cName = c.getAttribute('Name') || 'Unknown', target = c.getAttribute('Target') || 'N/A', value = c.textContent || c.getAttribute('Default') || 'N/A';
+        if (type === 'Port') ports += "• " + cName + " (" + target + "): " + value + "\n";
+        if (type === 'Variable') envs += "• " + cName + " (" + target + "): " + value + "\n";
+        if (type === 'Path') vols += "• " + cName + " (" + target + "): " + value + "\n";
+    }
+
+    var displayDate = foundSnap.replace('docker_snapshot_', '').replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3');
+    var detailsContainer = btnElement.closest('.dd-details-left');
+    
+    var newHTML = '<div class="detail-header-wrapper" style="border-bottom:none; margin-bottom:15px;"><div class="detail-header-left"><img src="' + getTagText('Icon') + '" style="filter: grayscale(100%);"><h2 style="margin:0;">' + containerName + ' <span class="badge-deleted">⚠️ This Docker has been DELETED!</span></h2></div></div>';
+    newHTML += '<div class="config-restored-alert">✅ Config restored from snapshot: ' + displayDate + '</div>';
+    newHTML += '<div class="dd-row dd-status"><span class="dd-label">Status:</span> <span class="dd-value" style="color:#b30000; font-weight:bold;">Offline</span></div>';
+    newHTML += '<div class="dd-row dd-repo"><span class="dd-label">Repository:</span> <span class="dd-value">' + getTagText('Repository') + '</span></div>';
+    newHTML += '<div class="dd-row dd-network"><span class="dd-label">Network:</span> <span class="dd-value">' + getTagText('Network') + ' (' + getTagText('NetworkType') + ')</span></div>';
+    newHTML += '<div class="dd-row dd-webui"><span class="dd-label">Web UI:</span> <span class="dd-value">' + getTagText('WebUI') + '</span></div>';
+    newHTML += '<div class="dd-block"><div class="dd-block-label">Overview:</div><pre class="dd-pre" style="white-space: pre-wrap;">' + getTagText('Overview') + '</pre></div>';
+    newHTML += '<div class="dd-block"><div class="dd-block-label">Ports:</div><pre class="dd-pre">' + (ports || 'N/A') + '</pre></div>';
+    newHTML += '<div class="dd-block"><div class="dd-block-label">Volumes:</div><pre class="dd-pre">' + (vols || 'N/A') + '</pre></div>';
+    newHTML += '<div class="dd-block"><div class="dd-block-label">Env Vars:</div><pre class="dd-pre">' + (envs || 'N/A') + '</pre></div>';
+    newHTML += '<div class="dd-block" style="margin-top:20px; text-align:right;"><a href="' + pluginDataRoot + '/' + foundSnap + '/xml/' + finalFileName + '" target="_blank" style="font-size:12px; color:#00698c; font-weight:bold; text-decoration:underline;">View Raw XML File</a></div>';
+    detailsContainer.innerHTML = newHTML;
+}
+
+function copyPath() {
+    navigator.clipboard.writeText("$WINDOWS_BASE\\\\docker_snapshot_$DATE").then(function() { alert("Path copied."); });
+}
+
+function goLatest() {
+    if (typeof allSnapshots !== 'undefined' && allSnapshots.length > 0) {
+        var latest = allSnapshots.slice().sort().reverse()[0];
+        window.location.href = '../' + latest + '/' + latest + '.html';
+    }
+}
+
+/** * INIT 
+ */
+window.onload = function() { 
+    if (typeof buildTree === 'function') buildTree(); 
+    if (typeof buildDeletedList === 'function') buildDeletedList(); 
+    if (typeof renderLedger === 'function') renderLedger(); 
+
+    var urlParams = new URLSearchParams(window.location.search);
+    var findMe = urlParams.get('find');
+    
+    if (findMe) {
+        var searchBox = document.getElementById('dockerArchiveSearch');
+        if (searchBox) {
+            searchBox.value = findMe;
+            document.getElementById('clearSearch').style.display = 'block';
+            executeGlobalSearch(findMe);
+        }
+
+        var sidebarLinks = document.querySelectorAll('#sidebarList a');
+        for (var i = 0; i < sidebarLinks.length; i++) {
+            var name = sidebarLinks[i].getAttribute('data-name');
+            if (name && name.toLowerCase().indexOf(findMe.toLowerCase()) > -1) {
+                sidebarLinks[i].click();
+                break;
+            }
+        }
+    }
+};
+</script>
+
+
+
+
+
+</body>
+</html>
+EOF
+
+    cat "/tmp/snap_txt_$DATE.tmp" > "$BACKUP_DIR/docker_snapshot_$DATE.txt" 2>/dev/null
+
+    if [ -f "/tmp/active_xmls_$DATE.txt" ]; then
+        while read -r active_file; do cp "$active_file" "$BACKUP_DIR/xml/"; done < "/tmp/active_xmls_$DATE.txt"
+    fi
+
+    chmod -R 777 "$BACKUP_DIR"
+
+	# ==========================================
+	# PLUGIN BRIDGE (Do not remove)
+	# ==========================================
+	# This links the report data on the array to the Unraid Plugin folder
+	# so it can be served securely via the WebUI Tools menu.
+
+	PLUGIN_DIR="/usr/local/emhttp/plugins/DockerReports"
+	mkdir -p "$PLUGIN_DIR/data"
+
+	# Create a symbolic link for the entire data directory
+	# Note: This is recreated on every run to ensure persistence after reboots
+	ln -sf "$REPORTS_BASE/"* "$PLUGIN_DIR/data/"
+
+	# Ensure the system has permission to read the linked assets
+	chmod -R 755 "$PLUGIN_DIR"
+
+
+    INDEX_FILE="$REPORTS_BASE/snapshot_list.js"
+    echo "Re-indexing archive..."
+    echo "const allSnapshots = [" > "$INDEX_FILE"
+    find "$REPORTS_BASE" -maxdepth 1 -type d -name "docker_snapshot_*" | sort -r | while read -r folder; do
+        echo "  \"$(basename "$folder")\"," >> "$INDEX_FILE"
+    done
+    echo "];" >> "$INDEX_FILE"
+    sed -i '$!N;s/,\n]/\n]/;P;D' "$INDEX_FILE" 2>/dev/null
+    
+    echo "Archive Index updated at:"
+	echo "<font color='#00698c'><i>$INDEX_FILE</i></font>"
+	echo " "
+	echo ""
+	echo "<div style='border-radius: 12px; background-color: #fff2d9; border: 1px solid #aaaaaa; padding: 12px; color: #555555; width:65%;'><span style='border-radius: 4px; background: #63884d; padding: 5px; '><b><font color='#ffffff' size='2'> 📋 Copy / Paste Paths &nbsp;</font></b></span><br><br>🪟<b> Windows Path:</b><br><font color='#00698c' size='1'>&nbsp;&nbsp;&nbsp;&nbsp;$WINDOWS_BASE\\docker_snapshot_$DATE</font> <br><br>🦊<b> Web Link:</b><br><font color='#00698c' size='1'>&nbsp;&nbsp;&nbsp;&nbsp;file:///${WINDOWS_BASE//\\\\//}/docker_snapshot_$DATE/docker_snapshot_$DATE.html</font></div>"
+    printf "<font color='#00698c'><b>⏰ Completed in %02dm %02ds</b></font>\n" $((($SECONDS - start_time)/60)) $((($SECONDS - start_time)%60))
+    echo ""
+    echo "<a href='/Tools/RuizDocker' target='RuizDocker' style='text-decoration: none; padding: 5px 20px; background-color: #e4e4e4; border-radius: 7px; border: 1px solid #b9b9b9; color: #515151;'>Docker Reports Page</a>"
+    echo " "
+else
+    echo "💎 No configuration changes detected. System is in sync."
+	echo " "
+    echo "<a href='/Tools/RuizDocker' target='RuizDocker' style='text-decoration: none; padding: 5px 20px; background-color: #e4e4e4; border-radius: 7px; border: 1px solid #b9b9b9; color: #515151;'>Docker Reports Page</a>"
+    echo " "
+    exit 0
+fi
+
+# Cleanup
+find "$REPORTS_BASE" -type d -name "docker_snapshot_*" -mtime +$KEEP_DAYS -exec rm -rf {} +
+rm -f "/tmp/active_xmls_$DATE.txt" "/tmp/snap_sidebar_$DATE.tmp" "/tmp/snap_grid_$DATE.tmp" "/tmp/snap_details_$DATE.tmp" "/tmp/snap_txt_$DATE.tmp"

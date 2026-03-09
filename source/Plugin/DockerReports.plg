@@ -1,0 +1,39 @@
+<?xml version='1.0' standalone='yes'?>
+<PLUGIN  name="Docker Reports" author="Community" version="2026.03.09" min="6.9.0">
+
+<FILE Name="/usr/local/emhttp/plugins/DockerReports/DockerReports.page">
+<INLINE>
+Menu="SystemInformation"
+Type="xmenu"
+Tabs="true"
+Title="Docker Reports"
+Icon="docker"
+---
+&lt;style&gt;
+    .docker-reports-frame {
+        width: 100%;
+        height: 88vh;
+        border: none;
+        margin-top: -30px;
+    }
+&lt;/style&gt;
+&lt;iframe src="/plugins/DockerReports/data/index.html" class="docker-reports-frame"&gt;&lt;/iframe&gt;
+</INLINE>
+</FILE>
+
+<FILE Name="/temp/docker_reports_install" Run="/bin/bash">
+<INLINE>
+echo "----------------------------------------------------"
+echo " Docker Reports Plugin Installed"
+echo " Access it via Tools -> Docker Reports"
+echo "----------------------------------------------------"
+</INLINE>
+</FILE>
+
+<FILE Method="remove">
+<COMMAND>
+rm -rf /usr/local/emhttp/plugins/DockerReports
+</COMMAND>
+</FILE>
+</PLUGIN>
+
