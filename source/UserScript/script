@@ -300,13 +300,13 @@ for container in $CONTAINERS; do
             for KEY in "${!TAG_MAP[@]}"; do
                 M_TAG="${TAG_MAP[$KEY]}"; CTX="${CTX_MAP[$KEY]}"; OLD="${OLD_VALS[$KEY]}"; NEW="${NEW_VALS[$KEY]}"
                 
-                # --- SANITIZE FOR LEDGER ---
-                L_OLD=$(clean_for_ledger "$OLD")
-                L_NEW=$(clean_for_ledger "$NEW")
+				# --- SANITIZE FOR LEDGER & SUMMARY ---
+                # We double-escape to prevent breakage from quotes or brackets
+                L_OLD=$(clean_for_ledger "$OLD" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                L_NEW=$(clean_for_ledger "$NEW" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
                 
-                # --- SANITIZE FOR SUMMARY ---
-                S_OLD=$(clean_for_summary "$OLD")
-                S_NEW=$(clean_for_summary "$NEW")
+                S_OLD=$(clean_for_summary "$OLD" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                S_NEW=$(clean_for_summary "$NEW" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
                 
                 TARGET_VAL=$(sed -n "/Name=\"$CTX\"/s/.*Target=\"\([^\"]*\)\".*/\1/p" "$XML_FILE" | head -1)
                 [ -z "$TARGET_VAL" ] && TARGET_VAL=$(sed -n "/Name=\"$CTX\"/s/.*Target=\"\([^\"]*\)\".*/\1/p" "$LAST_XML" | head -1)
@@ -350,19 +350,29 @@ for container in $CONTAINERS; do
         
         if [ "$OLD_EP" != "$EXTRA_PARAMS" ]; then
             TRIGGER_FULL_BACKUP=true
-            L_OLD_EP=$(clean_for_ledger "$OLD_EP"); L_NEW_EP=$(clean_for_ledger "$EXTRA_PARAMS")
-            S_OLD_EP=$(clean_for_summary "$OLD_EP"); S_NEW_EP=$(clean_for_summary "$EXTRA_PARAMS")
+            # Sanitize and escape dangerous characters (brackets and quotes)
+            L_OLD_EP=$(clean_for_ledger "$OLD_EP" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            L_NEW_EP=$(clean_for_ledger "$EXTRA_PARAMS" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            S_OLD_EP=$(clean_for_summary "$OLD_EP" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            S_NEW_EP=$(clean_for_summary "$EXTRA_PARAMS" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            
             SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-changed'>ExtraParams</span> <span class='ledger-text'>updated</span> <div class='ledger-value-change'><span class='change-old'>${L_OLD_EP:-None}</span> <span class='change-arrow'>&#10142;</span> <span class='change-new'>${L_NEW_EP:-None}</span></div></li>"
             SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-changed'>ExtraParams</span> <span class='summary-text'>updated</span> <div class='summary-value-change'><span class='sum-old'>${S_OLD_EP:-None}</span> <span class='sum-arrow'>&#10142;</span> <span class='sum-new'>${S_NEW_EP:-None}</span></div></li>"
         fi
+
         if [ "$OLD_PA" != "$POST_ARGS" ]; then
             TRIGGER_FULL_BACKUP=true
-            L_OLD_PA=$(clean_for_ledger "$OLD_PA"); L_NEW_PA=$(clean_for_ledger "$POST_ARGS")
-            S_OLD_PA=$(clean_for_summary "$OLD_PA"); S_NEW_PA=$(clean_for_summary "$POST_ARGS")
+            # Sanitize and escape dangerous characters (brackets and quotes)
+            L_OLD_PA=$(clean_for_ledger "$OLD_PA" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            L_NEW_PA=$(clean_for_ledger "$POST_ARGS" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            S_OLD_PA=$(clean_for_summary "$OLD_PA" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            S_NEW_PA=$(clean_for_summary "$POST_ARGS" | sed 's/"/\&quot;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            
             SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-changed'>PostArgs</span> <span class='ledger-text'>updated</span> <div class='ledger-value-change'><span class='change-old'>${L_OLD_PA:-None}</span> <span class='change-arrow'>&#10142;</span> <span class='change-new'>${L_NEW_PA:-None}</span></div></li>"
             SCAN_SUMMARY_ENTRIES+="<li><span class='summary-pill sum-label-changed'>PostArgs</span> <span class='summary-text'>updated</span> <div class='summary-value-change'><span class='sum-old'>${S_OLD_PA:-None}</span> <span class='sum-arrow'>&#10142;</span> <span class='sum-new'>${S_NEW_PA:-None}</span></div></li>"
         fi
-        # Network change (Simple text, no special cleaning usually needed here)
+
+        # Network change (Simple text, usually safe but adding basic N/A protection)
         if [ "$OLD_NET_TYPE" != "$NET_TYPE" ] || [ "$OLD_NET_NAME" != "$NETWORK" ]; then
              TRIGGER_FULL_BACKUP=true
              SCAN_LEDGER_ENTRIES+="<li><span class='ledger-pill label-changed'>Network</span> <span class='ledger-text'>changed</span> <div class='ledger-value-change'><span class='change-old'>${OLD_NET_NAME:-N/A} (${OLD_NET_TYPE:-N/A})</span> <span class='change-arrow'>&#10142;</span> <span class='change-new'>$NETWORK ($NET_TYPE)</span></div></li>"
